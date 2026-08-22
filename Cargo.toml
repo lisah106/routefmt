@@ -1,0 +1,8 @@
+[package]
+name = "routefmt"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "routefmt"
+path = "src/main.rs"
