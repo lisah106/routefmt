@@ -106,3 +106,119 @@ fn param_name(segment: &str) -> Option<&str> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_passes_through_wildcard() {
+        assert_eq!(normalize_segment("*").unwrap(), "*");
+    }
+
+    #[test]
+    fn segment_lowercases_static_text() {
+        assert_eq!(normalize_segment("Users").unwrap(), "users");
+        assert_eq!(normalize_segment("POSTS").unwrap(), "posts");
+    }
+
+    #[test]
+    fn segment_normalizes_colon_param() {
+        assert_eq!(normalize_segment(":id").unwrap(), ":id");
+    }
+
+    #[test]
+    fn segment_normalizes_brace_param() {
+        assert_eq!(normalize_segment("{id}").unwrap(), ":id");
+    }
+
+    #[test]
+    fn segment_normalizes_angle_param() {
+        assert_eq!(normalize_segment("<id>").unwrap(), ":id");
+    }
+
+    #[test]
+    fn segment_rejects_empty_param_name() {
+        assert!(matches!(
+            normalize_segment(":"),
+            Err(NormalizeError::EmptyParamName(_))
+        ));
+        assert!(matches!(
+            normalize_segment("{}"),
+            Err(NormalizeError::EmptyParamName(_))
+        ));
+    }
+
+    #[test]
+    fn segment_rejects_punctuation_in_param_name() {
+        assert!(matches!(
+            normalize_segment(":user-id"),
+            Err(NormalizeError::InvalidParamName(_))
+        ));
+        assert!(matches!(
+            normalize_segment("{user.id}"),
+            Err(NormalizeError::InvalidParamName(_))
+        ));
+    }
+
+    #[test]
+    fn segment_allows_underscore_in_param_name() {
+        assert_eq!(normalize_segment(":user_id").unwrap(), ":user_id");
+    }
+
+    #[test]
+    fn path_collapses_repeated_slashes() {
+        assert_eq!(normalize_path("/users//1//posts").unwrap(), "/users/1/posts");
+    }
+
+    #[test]
+    fn path_strips_leading_and_trailing_slashes() {
+        assert_eq!(normalize_path("users/1/").unwrap(), "/users/1");
+        assert_eq!(normalize_path("/users/1/").unwrap(), "/users/1");
+    }
+
+    #[test]
+    fn path_of_just_slashes_is_root() {
+        assert_eq!(normalize_path("/").unwrap(), "/");
+        assert_eq!(normalize_path("").unwrap(), "/");
+        assert_eq!(normalize_path("///").unwrap(), "/");
+    }
+
+    #[test]
+    fn path_propagates_segment_errors() {
+        assert!(normalize_path("/users/{}/posts").is_err());
+    }
+
+    #[test]
+    fn route_defaults_missing_method_to_get() {
+        assert_eq!(
+            normalize_route("/health").unwrap(),
+            Some("GET /health".to_string())
+        );
+    }
+
+    #[test]
+    fn route_skips_blank_and_comment_lines() {
+        assert_eq!(normalize_route("").unwrap(), None);
+        assert_eq!(normalize_route("   ").unwrap(), None);
+        assert_eq!(normalize_route("# a comment").unwrap(), None);
+    }
+
+    #[test]
+    fn route_uppercases_known_method() {
+        assert_eq!(
+            normalize_route("get /Users/{id}/Posts//").unwrap(),
+            Some("GET /users/:id/posts".to_string())
+        );
+    }
+
+    #[test]
+    fn route_treats_unknown_leading_token_as_path() {
+        // "foo" isn't a known method, so with no whitespace to split on
+        // the whole thing is the path, not a method that got dropped.
+        assert_eq!(
+            normalize_route("foo/bar").unwrap(),
+            Some("GET /foo/bar".to_string())
+        );
+    }
+}
