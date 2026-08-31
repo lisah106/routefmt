@@ -61,6 +61,14 @@ parameter name like `{}`, or a parameter name with punctuation in
 it) are reported on stderr with their line number, and the process
 exits non-zero, but valid lines before and after are still printed.
 
+Once a line normalizes, it's also checked against every route seen
+so far. Two routes collide if they have the same method and the
+same path shape once parameter names are ignored, since a router
+can't tell `GET /users/:id` and `GET /users/:name` apart at request
+time. A collision is reported on stderr, pointing at the first line
+the shape appeared on, and the process exits non-zero, but both
+routes are still printed to stdout.
+
 ## Building
 
 Standard library only, no dependencies:
@@ -71,10 +79,9 @@ cargo build --release
 
 ## What it doesn't do yet
 
-It normalizes one route at a time. It doesn't yet compare routes
-against each other, so it won't tell you that `GET /users/:id` and
-`GET /users/:name` are the same route with a different parameter
-name. That's the next thing to build on top of this.
+It only checks stdout output for problems; it doesn't have a mode
+for CI to fail on unformatted input without printing anything, and
+it can't rewrite files in place. Both are next.
 
 ## License
 

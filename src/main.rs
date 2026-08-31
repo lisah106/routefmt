@@ -1,5 +1,6 @@
 mod normalize;
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -29,10 +30,23 @@ fn main() -> ExitCode {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let mut had_error = false;
+    let mut seen: HashMap<String, usize> = HashMap::new();
 
     for (i, line) in input.lines().enumerate() {
         match normalize::normalize_route(line) {
             Ok(Some(normalized)) => {
+                let key = normalize::collision_key(&normalized);
+                if let Some(&first_line) = seen.get(&key) {
+                    eprintln!(
+                        "routefmt: line {}: route collides with line {} after normalization",
+                        i + 1,
+                        first_line
+                    );
+                    had_error = true;
+                } else {
+                    seen.insert(key, i + 1);
+                }
+
                 if let Err(e) = writeln!(out, "{}", normalized) {
                     eprintln!("routefmt: failed to write output: {}", e);
                     return ExitCode::FAILURE;

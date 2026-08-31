@@ -92,6 +92,23 @@ fn normalize_segment(segment: &str) -> Result<String, NormalizeError> {
     Ok(segment.to_lowercase())
 }
 
+/// Reduces an already-normalized "METHOD /path" line to a key that two
+/// routes share exactly when they'd collide at runtime: param names don't
+/// matter to a router, only where the params sit in the path, so `:id` and
+/// `:name` at the same position are folded to the same placeholder.
+pub fn collision_key(normalized_route: &str) -> String {
+    let mut parts = normalized_route.splitn(2, ' ');
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+
+    let generic_path: Vec<&str> = path
+        .split('/')
+        .map(|seg| if seg.starts_with(':') { ":" } else { seg })
+        .collect();
+
+    format!("{} {}", method, generic_path.join("/"))
+}
+
 /// Recognizes the three param spellings people actually use in the wild:
 /// `:id`, `{id}`, and `<id>`. Returns the bare name in all three cases.
 fn param_name(segment: &str) -> Option<&str> {
@@ -219,6 +236,38 @@ mod tests {
         assert_eq!(
             normalize_route("foo/bar").unwrap(),
             Some("GET /foo/bar".to_string())
+        );
+    }
+
+    #[test]
+    fn collision_key_folds_different_param_names_together() {
+        assert_eq!(
+            collision_key("GET /users/:id"),
+            collision_key("GET /users/:name")
+        );
+    }
+
+    #[test]
+    fn collision_key_distinguishes_static_segments() {
+        assert_ne!(
+            collision_key("GET /users/:id"),
+            collision_key("GET /users/active")
+        );
+    }
+
+    #[test]
+    fn collision_key_distinguishes_methods() {
+        assert_ne!(
+            collision_key("GET /users/:id"),
+            collision_key("POST /users/:id")
+        );
+    }
+
+    #[test]
+    fn collision_key_distinguishes_path_length() {
+        assert_ne!(
+            collision_key("GET /users/:id"),
+            collision_key("GET /users/:id/posts")
         );
     }
 }
