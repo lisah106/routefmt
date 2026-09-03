@@ -69,6 +69,16 @@ time. A collision is reported on stderr, pointing at the first line
 the shape appeared on, and the process exits non-zero, but both
 routes are still printed to stdout.
 
+To check a route table in CI without rewriting anything, use
+`--check`. It runs the same normalization and collision checks but
+never prints to stdout; any line that isn't already canonical, or
+any collision, is reported on stderr and the process exits non-zero.
+A clean, already-normalized table exits zero and prints nothing.
+
+```sh
+routefmt --check routes.txt
+```
+
 ## Building
 
 Standard library only, no dependencies:
@@ -79,9 +89,9 @@ cargo build --release
 
 ## What it doesn't do yet
 
-It only checks stdout output for problems; it doesn't have a mode
-for CI to fail on unformatted input without printing anything, and
-it can't rewrite files in place. Both are next.
+It can't rewrite files in place; you have to redirect stdout
+yourself. It also only understands one route per line, not route
+tables embedded in a framework's own config format.
 
 ## License
 
