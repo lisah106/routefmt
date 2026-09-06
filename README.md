@@ -79,6 +79,18 @@ A clean, already-normalized table exits zero and prints nothing.
 routefmt --check routes.txt
 ```
 
+To rewrite files instead of redirecting stdout yourself, use
+`--in-place`. Each file is normalized and checked for collisions on its
+own, so errors and collisions are reported against that file's path
+rather than a bare line number. A file is only written back to disk if
+its normalized form actually differs from what's already there.
+`--in-place` requires at least one file; there's no file to rewrite when
+reading from stdin, and it can't be combined with `--check`.
+
+```sh
+routefmt --in-place api-v1.txt api-v2.txt
+```
+
 ## Building
 
 Standard library only, no dependencies:
@@ -89,9 +101,8 @@ cargo build --release
 
 ## What it doesn't do yet
 
-It can't rewrite files in place; you have to redirect stdout
-yourself. It also only understands one route per line, not route
-tables embedded in a framework's own config format.
+It only understands one route per line, not route tables embedded in
+a framework's own config format.
 
 ## License
 

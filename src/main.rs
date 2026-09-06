@@ -8,28 +8,49 @@ use std::process::ExitCode;
 
 struct Args {
     check: bool,
+    in_place: bool,
     paths: Vec<String>,
 }
 
-/// The only flag so far is `--check`; anything else is a file path.
-/// There's no `--` escape yet because there's nothing to escape: routefmt
-/// doesn't take any option that looks like a path.
+/// The flags so far are `--check` and `--in-place`; anything else is a
+/// file path. There's no `--` escape yet because there's nothing to
+/// escape: routefmt doesn't take any option that looks like a path.
 fn parse_args(raw: &[String]) -> Args {
     let mut check = false;
+    let mut in_place = false;
     let mut paths = Vec::new();
     for arg in raw {
         if arg == "--check" {
             check = true;
+        } else if arg == "--in-place" {
+            in_place = true;
         } else {
             paths.push(arg.clone());
         }
     }
-    Args { check, paths }
+    Args { check, in_place, paths }
 }
 
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().skip(1).collect();
     let args = parse_args(&raw_args);
+
+    if args.check && args.in_place {
+        eprintln!("routefmt: --check and --in-place cannot be used together");
+        return ExitCode::FAILURE;
+    }
+
+    if args.in_place {
+        if args.paths.is_empty() {
+            eprintln!("routefmt: --in-place requires at least one file");
+            return ExitCode::FAILURE;
+        }
+        return if run_in_place(&args.paths) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
 
     let input = if args.paths.is_empty() {
         match read_stdin() {
@@ -69,28 +90,73 @@ fn main() -> ExitCode {
 }
 
 fn run_format(input: &str) -> io::Result<bool> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let (formatted, had_error) = format_text(input, "");
+    io::stdout().write_all(formatted.as_bytes())?;
+    Ok(had_error)
+}
+
+/// Rewrites each file in place with its normalized contents. Files are
+/// processed independently of each other: collisions and errors are
+/// scoped to a single file (so its messages carry the path instead of a
+/// bare line number), and a file is only touched on disk if its
+/// normalized form actually differs from what's already there.
+fn run_in_place(paths: &[String]) -> bool {
+    let mut had_error = false;
+    for path in paths {
+        let contents = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("routefmt: {}: {}", path, e);
+                had_error = true;
+                continue;
+            }
+        };
+
+        let (formatted, file_had_error) = format_text(&contents, path);
+        if file_had_error {
+            had_error = true;
+        }
+
+        if formatted != contents {
+            if let Err(e) = fs::write(path, &formatted) {
+                eprintln!("routefmt: {}: failed to write: {}", path, e);
+                had_error = true;
+            }
+        }
+    }
+    had_error
+}
+
+/// Normalizes every line of `input`, collecting the rewritten output as a
+/// single string instead of writing it anywhere, so callers can either
+/// print it (stdout) or compare it against a file's existing contents
+/// (in-place) before deciding what to do with it. `label` prefixes error
+/// and collision messages with a file path; pass "" when there's no
+/// single file to point at (stdin, or multiple files concatenated).
+fn format_text(input: &str, label: &str) -> (String, bool) {
+    let mut out = String::new();
     let mut had_error = false;
     let mut seen: HashMap<String, usize> = HashMap::new();
 
     for (i, line) in input.lines().enumerate() {
+        let line_no = i + 1;
         match normalize::normalize_route(line) {
             Ok(Some(normalized)) => {
-                if record_collision(&mut seen, &normalized, i + 1) {
+                if record_collision(&mut seen, &normalized, line_no, label) {
                     had_error = true;
                 }
-                writeln!(out, "{}", normalized)?;
+                out.push_str(&normalized);
+                out.push('\n');
             }
             Ok(None) => {}
             Err(e) => {
-                eprintln!("routefmt: line {}: {}", i + 1, e);
+                eprintln!("{}", format_location(label, line_no, &e.to_string()));
                 had_error = true;
             }
         }
     }
 
-    Ok(had_error)
+    (out, had_error)
 }
 
 /// Same checks as `run_format`, but it never writes a rewrite to stdout:
@@ -101,24 +167,28 @@ fn run_check(input: &str) -> bool {
     let mut seen: HashMap<String, usize> = HashMap::new();
 
     for (i, line) in input.lines().enumerate() {
+        let line_no = i + 1;
         match normalize::normalize_route(line) {
             Ok(Some(normalized)) => {
-                if record_collision(&mut seen, &normalized, i + 1) {
+                if record_collision(&mut seen, &normalized, line_no, "") {
                     had_error = true;
                 }
 
                 if !is_normalized(line, &normalized) {
                     eprintln!(
-                        "routefmt: line {}: not normalized, expected '{}'",
-                        i + 1,
-                        normalized
+                        "{}",
+                        format_location(
+                            "",
+                            line_no,
+                            &format!("not normalized, expected '{}'", normalized)
+                        )
                     );
                     had_error = true;
                 }
             }
             Ok(None) => {}
             Err(e) => {
-                eprintln!("routefmt: line {}: {}", i + 1, e);
+                eprintln!("{}", format_location("", line_no, &e.to_string()));
                 had_error = true;
             }
         }
@@ -129,17 +199,37 @@ fn run_check(input: &str) -> bool {
 
 /// Records `normalized`'s collision key as having first appeared on
 /// `line_no`, or reports and returns true if that shape was already seen.
-fn record_collision(seen: &mut HashMap<String, usize>, normalized: &str, line_no: usize) -> bool {
+fn record_collision(
+    seen: &mut HashMap<String, usize>,
+    normalized: &str,
+    line_no: usize,
+    label: &str,
+) -> bool {
     let key = normalize::collision_key(normalized);
     if let Some(&first_line) = seen.get(&key) {
         eprintln!(
-            "routefmt: line {}: route collides with line {} after normalization",
-            line_no, first_line
+            "{}",
+            format_location(
+                label,
+                line_no,
+                &format!("route collides with line {} after normalization", first_line)
+            )
         );
         true
     } else {
         seen.insert(key, line_no);
         false
+    }
+}
+
+/// Formats a diagnostic as `routefmt: line N: msg`, or, when `label` is a
+/// file path (used for `--in-place`, where several files are processed
+/// independently), `routefmt: path: line N: msg`.
+fn format_location(label: &str, line_no: usize, msg: &str) -> String {
+    if label.is_empty() {
+        format!("routefmt: line {}: {}", line_no, msg)
+    } else {
+        format!("routefmt: {}: line {}: {}", label, line_no, msg)
     }
 }
 
@@ -191,9 +281,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_recognizes_in_place_flag() {
+        let raw = vec!["--in-place".to_string(), "routes.txt".to_string()];
+        let args = parse_args(&raw);
+        assert!(args.in_place);
+        assert_eq!(args.paths, vec!["routes.txt".to_string()]);
+    }
+
+    #[test]
     fn parse_args_defaults_to_no_check_and_no_paths() {
         let args = parse_args(&[]);
         assert!(!args.check);
+        assert!(!args.in_place);
         assert!(args.paths.is_empty());
     }
 
@@ -215,8 +314,8 @@ mod tests {
     #[test]
     fn record_collision_flags_repeated_shape_and_keeps_first_line() {
         let mut seen = HashMap::new();
-        assert!(!record_collision(&mut seen, "GET /users/:id", 1));
-        assert!(record_collision(&mut seen, "GET /users/:name", 4));
+        assert!(!record_collision(&mut seen, "GET /users/:id", 1, ""));
+        assert!(record_collision(&mut seen, "GET /users/:name", 4, ""));
         assert_eq!(seen.get("GET /users/:"), Some(&1));
     }
 
@@ -233,5 +332,59 @@ mod tests {
     #[test]
     fn run_check_fails_on_collision() {
         assert!(run_check("GET /users/:id\nGET /users/:name\n"));
+    }
+
+    #[test]
+    fn format_text_prefixes_errors_with_label() {
+        let (_, had_error) = format_text("GET /users/{}\n", "routes.txt");
+        assert!(had_error);
+    }
+
+    fn temp_path(name: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("routefmt-test-{}-{}", std::process::id(), name))
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn run_in_place_rewrites_unnormalized_file() {
+        let path = temp_path("rewrites-unnormalized");
+        fs::write(&path, "get /Users/{id}\n").unwrap();
+
+        assert!(!run_in_place(&[path.clone()]));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "GET /users/:id\n");
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn run_in_place_leaves_already_normalized_file_untouched() {
+        let path = temp_path("leaves-normalized-alone");
+        fs::write(&path, "GET /users/:id\n").unwrap();
+        let before = fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert!(!run_in_place(&[path.clone()]));
+        let after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn run_in_place_reports_error_but_still_writes_valid_lines() {
+        let path = temp_path("reports-error");
+        fs::write(&path, "GET /users/{}\nget /Posts\n").unwrap();
+
+        assert!(run_in_place(&[path.clone()]));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "GET /posts\n");
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn run_in_place_reports_missing_file_without_panicking() {
+        let path = temp_path("does-not-exist");
+        assert!(run_in_place(&[path]));
     }
 }
