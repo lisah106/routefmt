@@ -36,6 +36,30 @@ GET /health
 DELETE /users/:id
 ```
 
+## Framework-style lines
+
+A line doesn't have to be `METHOD /path`. If it has a quoted string that
+looks like a path, routefmt pulls the method from whatever word comes
+right before it, which is enough to cover routes copied straight out of
+a framework's own source instead of a dedicated route table:
+
+```
+app.get('/Users/{id}', handler)
+router.post("/users", create)
+delete '/users/<id>'
+```
+
+Normalizes to:
+
+```
+GET /users/:id
+POST /users
+DELETE /users/:id
+```
+
+A quoted string with no recognized method before it (a bare JSON value,
+say) defaults to `GET`, same as a path with no method column at all.
+
 ## Usage
 
 From a file:
@@ -101,8 +125,10 @@ cargo build --release
 
 ## What it doesn't do yet
 
-It only understands one route per line, not route tables embedded in
-a framework's own config format.
+It only understands one route per line: it can pull a route out of a
+single line of framework source (see above), but it can't follow a
+route split across several lines, like a YAML or JSON entry with the
+method and path in separate keys.
 
 ## License
 
