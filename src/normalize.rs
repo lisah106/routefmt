@@ -7,6 +7,7 @@ const KNOWN_METHODS: [&str; 7] =
 pub enum NormalizeError {
     EmptyParamName(String),
     InvalidParamName(String),
+    UnknownMethod(String),
 }
 
 impl fmt::Display for NormalizeError {
@@ -21,6 +22,9 @@ impl fmt::Display for NormalizeError {
                     "parameter name in segment '{}' must be alphanumeric or underscore",
                     seg
                 )
+            }
+            NormalizeError::UnknownMethod(method) => {
+                write!(f, "unknown HTTP method '{}'", method)
             }
         }
     }
@@ -47,6 +51,91 @@ pub fn normalize_route(line: &str) -> Result<Option<String>, NormalizeError> {
     };
     let normalized_path = normalize_path(path)?;
     Ok(Some(format!("{} {}", method, normalized_path)))
+}
+
+/// Which half of a `METHOD /path` pair a table line supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableField {
+    Method,
+    Path,
+}
+
+/// Recognizes one `method` or `path` key from a route table where the two
+/// live on separate lines, as in a YAML list entry or a pretty-printed JSON
+/// object with the braces on their own lines:
+///   - method: GET
+///     path: /users/:id
+///   {
+///     "method": "GET",
+///     "path": "/users/:id"
+///   }
+/// Any other key (name, handler, description, ...) is ignored, so unrelated
+/// fields in the same entry don't get mistaken for a route.
+///
+/// This is a line scan, not a parser, so it only handles one key per line,
+/// and a `{`/`}` isn't stripped from a value the way it would be by a real
+/// JSON parser (deliberately - a path can legitimately end in a `{id}`
+/// placeholder, and there'd be no reliable way to tell that apart from an
+/// object's closing brace tacked onto the same line). A single-line object
+/// with both keys crammed together (`{"method": "GET", "path": "/users"}`)
+/// is rejected outright for the same reason: telling the value's closing
+/// quote from the next key's opening one needs real JSON parsing.
+pub fn extract_table_field(line: &str) -> Option<(TableField, String)> {
+    let trimmed = line.trim().trim_start_matches('-').trim();
+
+    let (key, rest) = trimmed.split_once(':')?;
+    let field = match unquote(key.trim()).to_lowercase().as_str() {
+        "method" => TableField::Method,
+        "path" => TableField::Path,
+        _ => return None,
+    };
+
+    let rest = rest.trim();
+    if let Some(comma_idx) = rest.find(',') {
+        let after = rest[comma_idx + 1..].trim();
+        let after = after.strip_prefix('"').or_else(|| after.strip_prefix('\'')).unwrap_or(after);
+        let next_key = after
+            .split(|c| c == ':' || c == '"' || c == '\'')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if next_key == "method" || next_key == "path" {
+            return None;
+        }
+    }
+
+    let value = unquote(rest.trim_end_matches(',').trim());
+    if value.is_empty() {
+        None
+    } else {
+        Some((field, value.to_string()))
+    }
+}
+
+/// Strips one layer of matching double or single quotes, if present.
+fn unquote(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Combines an explicit method and path pulled from separate table keys
+/// into the same canonical form `normalize_route` produces. Unlike a bare
+/// path line, the method here isn't optional or inferred, so an unknown
+/// one is an error instead of silently defaulting to GET.
+pub fn normalize_table_route(method: &str, path: &str) -> Result<String, NormalizeError> {
+    let upper = method.to_uppercase();
+    if !KNOWN_METHODS.contains(&upper.as_str()) {
+        return Err(NormalizeError::UnknownMethod(method.to_string()));
+    }
+    let normalized_path = normalize_path(path)?;
+    Ok(format!("{} {}", upper, normalized_path))
 }
 
 /// Looks for a quoted path inside a line of code, since that's how routes
@@ -400,5 +489,88 @@ mod tests {
             normalize_route("get /Users/{id}/Posts//").unwrap(),
             Some("GET /users/:id/posts".to_string())
         );
+    }
+
+    #[test]
+    fn extract_table_field_reads_yaml_list_entry() {
+        assert_eq!(
+            extract_table_field("- method: GET"),
+            Some((TableField::Method, "GET".to_string()))
+        );
+        assert_eq!(
+            extract_table_field("  path: /users/:id"),
+            Some((TableField::Path, "/users/:id".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_table_field_reads_quoted_json_key() {
+        assert_eq!(
+            extract_table_field("\"method\": \"GET\","),
+            Some((TableField::Method, "GET".to_string()))
+        );
+        assert_eq!(
+            extract_table_field("  \"path\": \"/users/:id\""),
+            Some((TableField::Path, "/users/:id".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_table_field_strips_a_lone_brace_line() {
+        assert_eq!(extract_table_field("{"), None);
+        assert_eq!(extract_table_field("},"), None);
+    }
+
+    #[test]
+    fn extract_table_field_ignores_unrelated_keys() {
+        assert_eq!(extract_table_field("name: list users"), None);
+        assert_eq!(extract_table_field("handler: listUsers"), None);
+    }
+
+    #[test]
+    fn extract_table_field_rejects_two_keys_crammed_on_one_line() {
+        assert_eq!(
+            extract_table_field("\"method\": \"GET\", \"path\": \"/users\""),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_table_field_keeps_brace_param_in_path_value() {
+        assert_eq!(
+            extract_table_field("  path: /users/{id}"),
+            Some((TableField::Path, "/users/{id}".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_table_field_rejects_empty_value() {
+        assert_eq!(extract_table_field("method:"), None);
+    }
+
+    #[test]
+    fn extract_table_field_ignores_lines_with_no_colon() {
+        assert_eq!(extract_table_field("GET /users/:id"), None);
+    }
+
+    #[test]
+    fn normalize_table_route_combines_method_and_path() {
+        assert_eq!(
+            normalize_table_route("get", "/Users/{id}").unwrap(),
+            "GET /users/:id".to_string()
+        );
+    }
+
+    #[test]
+    fn normalize_table_route_rejects_unknown_method() {
+        assert!(matches!(
+            normalize_table_route("FETCH", "/users"),
+            Err(NormalizeError::UnknownMethod(_))
+        ));
+    }
+
+    #[test]
+    fn normalize_table_route_propagates_path_errors() {
+        assert!(normalize_table_route("GET", "/users/{}").is_err());
     }
 }

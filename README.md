@@ -60,6 +60,55 @@ DELETE /users/:id
 A quoted string with no recognized method before it (a bare JSON value,
 say) defaults to `GET`, same as a path with no method column at all.
 
+## Route tables with separate method/path keys
+
+A route doesn't have to fit on one line. routefmt also follows a `method`
+key and a `path` key across separate lines, which is how route tables
+usually look once they're written as YAML or pretty-printed JSON instead
+of a single-line call:
+
+```yaml
+- method: GET
+  path: /users/:id
+- method: post
+  path: /users
+```
+
+```json
+{
+  "method": "GET",
+  "path": "/users/:id"
+}
+```
+
+Normalizes to:
+
+```
+GET /users/:id
+POST /users
+```
+
+Any other key in the same entry (`name`, `handler`, a JSON object's own
+`{`/`}` lines, ...) is ignored. A `method` and a `path` are paired up as
+soon as both have been seen since the last completed entry, so blank
+lines and unrelated keys in between don't break the pairing. Unlike a
+bare path with no method column, a method given this way is required to
+be a real HTTP method; an entry that only has one of the two keys by the
+end of the input is reported as an incomplete entry.
+
+This is a line-by-line scan, not a JSON or YAML parser, so it only reads
+one key per line. A single-line object with both keys on it, like
+`{"method": "GET", "path": "/users"}`, isn't recognized: telling the
+value's closing quote from the next key's opening one needs an actual
+parser, so that form is left alone rather than guessed at.
+
+Because a table entry has no single-line textual form, `--check` skips
+the "is this line already normalized" comparison for it; it still runs
+the collision check against every other route. `--in-place` rewrites a
+table file into plain `METHOD /path` lines the same as it would rewrite
+any other input, which means anything in the file besides the routes
+themselves (other keys, comments, formatting) is dropped.
+
 ## Usage
 
 From a file:
@@ -125,10 +174,10 @@ cargo build --release
 
 ## What it doesn't do yet
 
-It only understands one route per line: it can pull a route out of a
-single line of framework source (see above), but it can't follow a
-route split across several lines, like a YAML or JSON entry with the
-method and path in separate keys.
+A route table entry has to spread its `method` and `path` across
+separate lines to be recognized (see above); a single line combining
+both, like `{"method": "GET", "path": "/users"}`, is left alone instead
+of being parsed as JSON.
 
 ## License
 

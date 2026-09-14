@@ -127,6 +127,84 @@ fn run_in_place(paths: &[String]) -> bool {
     had_error
 }
 
+/// One route recovered from the input, or an error tied to a line number.
+/// `from_table` marks a route that was assembled from separate `method`/
+/// `path` keys across more than one line, as opposed to a single line that
+/// already read as `METHOD /path` (or an embedded framework call).
+enum LineOutcome {
+    Route { line_no: usize, normalized: String, from_table: bool },
+    Error { line_no: usize, message: String },
+}
+
+/// Scans every line of `input` for routes, following two forms at once: a
+/// plain or framework-embedded route on a single line (handled entirely by
+/// `normalize::normalize_route`), and a route table where `method` and
+/// `path` show up as separate keys on separate lines, YAML- or JSON-style.
+/// For the latter, a `method` key and a `path` key are paired up as soon as
+/// both have been seen since the last completed entry - lines in between
+/// (blank lines, other keys, closing braces) don't reset the pairing, so an
+/// indented YAML list entry or a pretty-printed JSON object both work.
+///
+/// A key left dangling at end of input (a `method` with no matching `path`,
+/// or vice versa) is reported as an error rather than silently dropped.
+fn scan_lines(input: &str) -> Vec<LineOutcome> {
+    let mut out = Vec::new();
+    let mut pending_method: Option<(String, usize)> = None;
+    let mut pending_path: Option<(String, usize)> = None;
+
+    for (i, line) in input.lines().enumerate() {
+        let line_no = i + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || is_structural_punctuation(trimmed) {
+            continue;
+        }
+
+        if let Some((field, value)) = normalize::extract_table_field(line) {
+            match field {
+                normalize::TableField::Method => pending_method = Some((value, line_no)),
+                normalize::TableField::Path => pending_path = Some((value, line_no)),
+            }
+            if pending_method.is_some() && pending_path.is_some() {
+                let (method, _) = pending_method.take().unwrap();
+                let (path, _) = pending_path.take().unwrap();
+                match normalize::normalize_table_route(&method, &path) {
+                    Ok(normalized) => out.push(LineOutcome::Route { line_no, normalized, from_table: true }),
+                    Err(e) => out.push(LineOutcome::Error { line_no, message: e.to_string() }),
+                }
+            }
+            continue;
+        }
+
+        match normalize::normalize_route(line) {
+            Ok(Some(normalized)) => out.push(LineOutcome::Route { line_no, normalized, from_table: false }),
+            Ok(None) => {}
+            Err(e) => out.push(LineOutcome::Error { line_no, message: e.to_string() }),
+        }
+    }
+
+    match (pending_method, pending_path) {
+        (Some((_, line_no)), None) => out.push(LineOutcome::Error {
+            line_no,
+            message: "incomplete route entry: method with no matching path".to_string(),
+        }),
+        (None, Some((_, line_no))) => out.push(LineOutcome::Error {
+            line_no,
+            message: "incomplete route entry: path with no matching method".to_string(),
+        }),
+        _ => {}
+    }
+
+    out
+}
+
+/// True for a line that's nothing but JSON/YAML structural noise (a lone
+/// `{`, `}`, `[`, `]`, `-`, or some combination with commas), so a
+/// pretty-printed object's opening and closing brace lines get skipped
+/// instead of being misread as a path-less route.
+fn is_structural_punctuation(trimmed: &str) -> bool {
+    !trimmed.is_empty() && trimmed.chars().all(|c| matches!(c, '{' | '}' | '[' | ']' | ',' | '-'))
+}
+
 /// Normalizes every line of `input`, collecting the rewritten output as a
 /// single string instead of writing it anywhere, so callers can either
 /// print it (stdout) or compare it against a file's existing contents
@@ -138,19 +216,17 @@ fn format_text(input: &str, label: &str) -> (String, bool) {
     let mut had_error = false;
     let mut seen: HashMap<String, usize> = HashMap::new();
 
-    for (i, line) in input.lines().enumerate() {
-        let line_no = i + 1;
-        match normalize::normalize_route(line) {
-            Ok(Some(normalized)) => {
+    for outcome in scan_lines(input) {
+        match outcome {
+            LineOutcome::Route { line_no, normalized, .. } => {
                 if record_collision(&mut seen, &normalized, line_no, label) {
                     had_error = true;
                 }
                 out.push_str(&normalized);
                 out.push('\n');
             }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("{}", format_location(label, line_no, &e.to_string()));
+            LineOutcome::Error { line_no, message } => {
+                eprintln!("{}", format_location(label, line_no, &message));
                 had_error = true;
             }
         }
@@ -162,19 +238,25 @@ fn format_text(input: &str, label: &str) -> (String, bool) {
 /// Same checks as `run_format`, but it never writes a rewrite to stdout:
 /// it only reports whether the input is already canonical, so a CI step
 /// can fail the build without a formatted copy showing up anywhere.
+///
+/// The "already canonical" comparison only makes sense for a route that
+/// lived on one line to begin with: a table entry's `method`/`path` keys
+/// can never read as `METHOD /path` verbatim, so there's nothing useful to
+/// diff there. Those entries still go through the error and collision
+/// checks; they just skip the text comparison.
 fn run_check(input: &str) -> bool {
     let mut had_error = false;
     let mut seen: HashMap<String, usize> = HashMap::new();
+    let lines: Vec<&str> = input.lines().collect();
 
-    for (i, line) in input.lines().enumerate() {
-        let line_no = i + 1;
-        match normalize::normalize_route(line) {
-            Ok(Some(normalized)) => {
+    for outcome in scan_lines(input) {
+        match outcome {
+            LineOutcome::Route { line_no, normalized, from_table } => {
                 if record_collision(&mut seen, &normalized, line_no, "") {
                     had_error = true;
                 }
 
-                if !is_normalized(line, &normalized) {
+                if !from_table && !is_normalized(lines[line_no - 1], &normalized) {
                     eprintln!(
                         "{}",
                         format_location(
@@ -186,9 +268,8 @@ fn run_check(input: &str) -> bool {
                     had_error = true;
                 }
             }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("{}", format_location("", line_no, &e.to_string()));
+            LineOutcome::Error { line_no, message } => {
+                eprintln!("{}", format_location("", line_no, &message));
                 had_error = true;
             }
         }
@@ -338,6 +419,64 @@ mod tests {
     fn format_text_prefixes_errors_with_label() {
         let (_, had_error) = format_text("GET /users/{}\n", "routes.txt");
         assert!(had_error);
+    }
+
+    #[test]
+    fn format_text_assembles_yaml_style_table_entries() {
+        let input = "- method: GET\n  path: /Users/{id}\n- method: post\n  path: /users\n";
+        let (formatted, had_error) = format_text(input, "");
+        assert!(!had_error);
+        assert_eq!(formatted, "GET /users/:id\nPOST /users\n");
+    }
+
+    #[test]
+    fn format_text_assembles_json_style_table_entries() {
+        let input = "{\n  \"method\": \"GET\",\n  \"path\": \"/users/:id\"\n}\n";
+        let (formatted, had_error) = format_text(input, "");
+        assert!(!had_error);
+        assert_eq!(formatted, "GET /users/:id\n");
+    }
+
+    #[test]
+    fn format_text_pairs_table_fields_regardless_of_order() {
+        let input = "- path: /users\n  method: post\n";
+        let (formatted, had_error) = format_text(input, "");
+        assert!(!had_error);
+        assert_eq!(formatted, "POST /users\n");
+    }
+
+    #[test]
+    fn format_text_reports_dangling_table_key() {
+        let input = "- method: GET\n";
+        let (formatted, had_error) = format_text(input, "");
+        assert!(had_error);
+        assert!(formatted.is_empty());
+    }
+
+    #[test]
+    fn format_text_reports_unknown_method_in_table_entry() {
+        let input = "- method: FETCH\n  path: /users\n";
+        let (_, had_error) = format_text(input, "");
+        assert!(had_error);
+    }
+
+    #[test]
+    fn is_structural_punctuation_matches_lone_brace_lines() {
+        assert!(is_structural_punctuation("{"));
+        assert!(is_structural_punctuation("},"));
+        assert!(is_structural_punctuation("["));
+        assert!(is_structural_punctuation("]"));
+        assert!(!is_structural_punctuation("- method: GET"));
+        assert!(!is_structural_punctuation("/"));
+    }
+
+    #[test]
+    fn run_check_skips_text_diff_for_table_entries_but_still_checks_collisions() {
+        let clean = "- method: GET\n  path: /users/:id\n";
+        assert!(!run_check(clean));
+
+        let colliding = "- method: GET\n  path: /users/:id\n- method: GET\n  path: /users/:name\n";
+        assert!(run_check(colliding));
     }
 
     fn temp_path(name: &str) -> String {
